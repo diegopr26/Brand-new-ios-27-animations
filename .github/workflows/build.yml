@@ -1,0 +1,519 @@
+name: Build LSPosed module
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Create project
+        run: |
+          set -e
+          D=app/src/main/java/com/ios27/anim
+          S=xposedstub/src/main/java/de/robv/android/xposed
+          mkdir -p $D $S/callbacks app/src/main/assets app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'iOS27'
+          include ':app', ':xposedstub'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+          echo "org.gradle.jvmargs=-Xmx2g" > gradle.properties
+
+          cat > xposedstub/build.gradle <<'EOF'
+          plugins { id 'java-library' }
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.ios27.anim'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.ios27.anim'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies { compileOnly project(':xposedstub') }
+          EOF
+
+          cat > $S/IXposedHookLoadPackage.java <<'EOF'
+          package de.robv.android.xposed;
+          public interface IXposedHookLoadPackage {
+              void handleLoadPackage(de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam lpparam) throws Throwable;
+          }
+          EOF
+          cat > $S/callbacks/XC_LoadPackage.java <<'EOF'
+          package de.robv.android.xposed.callbacks;
+          public abstract class XC_LoadPackage {
+              public static class LoadPackageParam {
+                  public String packageName;
+                  public ClassLoader classLoader;
+              }
+          }
+          EOF
+          cat > $S/XC_MethodHook.java <<'EOF'
+          package de.robv.android.xposed;
+          public abstract class XC_MethodHook {
+              public XC_MethodHook() {}
+              protected void beforeHookedMethod(MethodHookParam param) throws Throwable {}
+              protected void afterHookedMethod(MethodHookParam param) throws Throwable {}
+              public static class MethodHookParam {
+                  public Object[] args;
+                  public Object thisObject;
+                  public void setResult(Object result) {}
+                  public Object getResult() { return null; }
+              }
+              public static class Unhook {}
+          }
+          EOF
+          cat > $S/XposedBridge.java <<'EOF'
+          package de.robv.android.xposed;
+          import java.util.Set;
+          public final class XposedBridge {
+              public static void log(String text) {}
+              public static Set<XC_MethodHook.Unhook> hookAllMethods(Class<?> c, String name, XC_MethodHook cb) { return null; }
+          }
+          EOF
+          cat > $S/XSharedPreferences.java <<'EOF'
+          package de.robv.android.xposed;
+          public class XSharedPreferences {
+              public XSharedPreferences(String packageName, String prefFileName) {}
+              public boolean reload() { return false; }
+              public boolean getBoolean(String key, boolean def) { return def; }
+              public int getInt(String key, int def) { return def; }
+          }
+          EOF
+          cat > $S/XposedHelpers.java <<'EOF'
+          package de.robv.android.xposed;
+          public final class XposedHelpers {
+              public static Class<?> findClass(String name, ClassLoader cl) { return null; }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="iOS 27 Animations" android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.DayNight">
+                  <activity android:name=".SettingsActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="iOS-style transitions with an in-app tuner" />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedsharedprefs" android:value="true" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/values/arrays.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>android</item>
+              </string-array>
+          </resources>
+          EOF
+          echo "com.ios27.anim.IosHook" > app/src/main/assets/xposed_init
+
+          cat > $D/SpringInterpolator.java <<'EOF'
+          package com.ios27.anim;
+
+          import android.view.animation.Interpolator;
+
+          /** Critically damped spring with an initial velocity: fast start, long soft settle, never overshoots. */
+          final class SpringInterpolator implements Interpolator {
+              private final float w;
+              private final float c;
+              private final float norm;
+
+              SpringInterpolator(float omega) {
+                  w = omega;
+                  c = omega * 0.25f;
+                  norm = g(1f);
+              }
+
+              private float g(float t) {
+                  return 1f - (1f + c * t) * (float) Math.exp(-w * t);
+              }
+
+              @Override
+              public float getInterpolation(float t) {
+                  if (t <= 0f) return 0f;
+                  if (t >= 1f) return 1f;
+                  return g(t) / norm;
+              }
+          }
+          EOF
+
+          cat > $D/IosConfig.java <<'EOF'
+          package com.ios27.anim;
+
+          import android.os.SystemClock;
+          import android.view.animation.Interpolator;
+          import android.view.animation.LinearInterpolator;
+          import android.view.animation.PathInterpolator;
+
+          import de.robv.android.xposed.XSharedPreferences;
+
+          final class IosConfig {
+              static final String PKG = "com.ios27.anim";
+              static final String PREFS = "settings";
+
+              boolean enabled = true;
+              int duration = 520;   // ms
+              int parallax = 30;    // % of screen width the old screen moves
+              int curve = 0;        // 0 Spring, 1 iOS ease, 2 Smooth, 3 Linear
+              int style = 0;        // 0 Push, 1 Sheet (slide up), 2 Zoom
+              int dim = 0;          // % the old screen darkens
+              int snap = 8;         // spring stiffness: higher = more front-loaded
+
+              private static XSharedPreferences xsp;
+              private static long last = -5000;
+              private static IosConfig cur = new IosConfig();
+
+              static synchronized IosConfig get() {
+                  long now = SystemClock.uptimeMillis();
+                  if (now - last < 800) return cur;
+                  last = now;
+                  try {
+                      if (xsp == null) xsp = new XSharedPreferences(PKG, PREFS);
+                      else xsp.reload();
+                      IosConfig c = new IosConfig();
+                      c.enabled = xsp.getBoolean("enabled", true);
+                      c.duration = xsp.getInt("duration", 520);
+                      c.parallax = xsp.getInt("parallax", 30);
+                      c.curve = xsp.getInt("curve", 0);
+                      c.style = xsp.getInt("style", 0);
+                      c.dim = xsp.getInt("dim", 0);
+                      c.snap = xsp.getInt("snap", 8);
+                      cur = c;
+                  } catch (Throwable ignored) { }
+                  return cur;
+              }
+
+              Interpolator interpolator() {
+                  switch (curve) {
+                      case 1: return new PathInterpolator(0.32f, 0.72f, 0f, 1f);
+                      case 2: return new PathInterpolator(0.25f, 0.1f, 0.25f, 1f);
+                      case 3: return new LinearInterpolator();
+                      default: return new SpringInterpolator(snap);
+                  }
+              }
+          }
+          EOF
+
+          cat > $D/IosAnimations.java <<'EOF'
+          package com.ios27.anim;
+
+          import android.view.animation.AlphaAnimation;
+          import android.view.animation.Animation;
+          import android.view.animation.AnimationSet;
+          import android.view.animation.ScaleAnimation;
+          import android.view.animation.TranslateAnimation;
+
+          final class IosAnimations {
+              private IosAnimations() {}
+
+              static Animation build(String name, IosConfig c) {
+                  if (name == null || !name.startsWith("activity_")) return null;
+                  if (name.contains("translucent") || name.contains("dream") || name.contains("wallpaper")) return null;
+                  boolean oe = name.contains("open_enter");
+                  boolean ox = name.contains("open_exit");
+                  boolean ce = name.contains("close_enter");
+                  boolean cx = name.contains("close_exit");
+                  if (!(oe || ox || ce || cx)) return null;
+
+                  float p = c.parallax / 100f;
+                  float dim = 1f - c.dim / 100f;
+                  float a0 = 1f, a1 = 1f;
+                  if (ox) a1 = dim;
+                  else if (ce) a0 = dim;
+
+                  AnimationSet set = new AnimationSet(false);
+                  switch (c.style) {
+                      case 1: // Sheet: new screen slides up from the bottom
+                          if (oe) set.addAnimation(move(0f, 0f, 1f, 0f, c));
+                          else if (cx) set.addAnimation(move(0f, 0f, 0f, 1f, c));
+                          break;
+                      case 2: // Zoom
+                          if (oe) { set.addAnimation(zoom(0.85f, 1f, c)); a0 = 0f; }
+                          else if (ox) set.addAnimation(zoom(1f, 0.94f, c));
+                          else if (ce) set.addAnimation(zoom(0.94f, 1f, c));
+                          else { set.addAnimation(zoom(1f, 0.85f, c)); a1 = 0f; }
+                          break;
+                      default: // Push (iOS navigation)
+                          if (oe) set.addAnimation(move(1f, 0f, 0f, 0f, c));
+                          else if (ox) set.addAnimation(move(0f, -p, 0f, 0f, c));
+                          else if (ce) set.addAnimation(move(-p, 0f, 0f, 0f, c));
+                          else set.addAnimation(move(0f, 1f, 0f, 0f, c));
+                  }
+
+                  AlphaAnimation fade = new AlphaAnimation(a0, a1);
+                  setup(fade, c);
+                  set.addAnimation(fade);
+
+                  // The screen that is arriving or leaving for good stays on top, so layers never flicker.
+                  set.setZAdjustment((oe || cx) ? Animation.ZORDER_TOP : Animation.ZORDER_BOTTOM);
+                  set.setDuration(c.duration);
+                  set.setFillEnabled(true);
+                  set.setFillBefore(true);
+                  set.setFillAfter(true);
+                  return set;
+              }
+
+              private static Animation move(float fx, float tx, float fy, float ty, IosConfig c) {
+                  TranslateAnimation t = new TranslateAnimation(
+                          Animation.RELATIVE_TO_PARENT, fx, Animation.RELATIVE_TO_PARENT, tx,
+                          Animation.RELATIVE_TO_PARENT, fy, Animation.RELATIVE_TO_PARENT, ty);
+                  setup(t, c);
+                  return t;
+              }
+
+              private static Animation zoom(float from, float to, IosConfig c) {
+                  ScaleAnimation s = new ScaleAnimation(from, to, from, to,
+                          Animation.RELATIVE_TO_SELF, 0.5f, Animation.RELATIVE_TO_SELF, 0.5f);
+                  setup(s, c);
+                  return s;
+              }
+
+              private static void setup(Animation a, IosConfig c) {
+                  a.setInterpolator(c.interpolator());
+                  a.setDuration(c.duration);
+                  a.setFillEnabled(true);
+                  a.setFillBefore(true);
+                  a.setFillAfter(true);
+              }
+          }
+          EOF
+
+          cat > $D/IosHook.java <<'EOF'
+          package com.ios27.anim;
+
+          import android.content.Context;
+          import android.content.res.Resources;
+          import android.view.animation.Animation;
+          import android.view.animation.AnimationUtils;
+
+          import java.util.Collections;
+          import java.util.HashSet;
+          import java.util.Set;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          public class IosHook implements IXposedHookLoadPackage {
+              private static final String TAG = "[iOS27] ";
+              private static final Set<String> SEEN = Collections.synchronizedSet(new HashSet<String>());
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
+                  if (!"android".equals(lp.packageName)) return;
+                  XposedBridge.log(TAG + "loaded in system_server");
+
+                  XC_MethodHook hook = new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam param) {
+                          try {
+                              if (param.args == null || param.args.length < 2) return;
+                              if (!(param.args[0] instanceof Context)) return;
+                              if (!(param.args[1] instanceof Integer)) return;
+                              Resources res = ((Context) param.args[0]).getResources();
+                              int id = (Integer) param.args[1];
+                              if (!"android".equals(res.getResourcePackageName(id))) return;
+                              String name = res.getResourceEntryName(id);
+                              if (SEEN.add(name)) XposedBridge.log(TAG + "anim requested: " + name);
+                              IosConfig c = IosConfig.get();
+                              if (!c.enabled) return;
+                              Animation a = IosAnimations.build(name, c);
+                              if (a != null) param.setResult(a);
+                          } catch (Throwable ignored) { }
+                      }
+                  };
+
+                  try {
+                      Class<?> ta = XposedHelpers.findClass(
+                              "com.android.internal.policy.TransitionAnimation", lp.classLoader);
+                      Set<?> s = XposedBridge.hookAllMethods(ta, "loadAnimationSafely", hook);
+                      XposedBridge.log(TAG + "TransitionAnimation hooks: " + (s == null ? 0 : s.size()));
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "TransitionAnimation failed: " + t);
+                  }
+                  try {
+                      Set<?> s = XposedBridge.hookAllMethods(AnimationUtils.class, "loadAnimation", hook);
+                      XposedBridge.log(TAG + "AnimationUtils hooks: " + (s == null ? 0 : s.size()));
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "AnimationUtils failed: " + t);
+                  }
+              }
+          }
+          EOF
+
+          cat > $D/SettingsActivity.java <<'EOF'
+          package com.ios27.anim;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Typeface;
+          import android.os.Bundle;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.RadioButton;
+          import android.widget.RadioGroup;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.Switch;
+          import android.widget.TextView;
+
+          public class SettingsActivity extends Activity {
+              private SharedPreferences sp;
+              private LinearLayout root;
+
+              @Override
+              @SuppressWarnings("deprecation")
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  boolean shared = true;
+                  try {
+                      sp = getSharedPreferences(IosConfig.PREFS, MODE_WORLD_READABLE);
+                  } catch (Throwable t) {
+                      shared = false;
+                      sp = getSharedPreferences(IosConfig.PREFS, MODE_PRIVATE);
+                  }
+
+                  ScrollView sv = new ScrollView(this);
+                  root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int pad = dp(20);
+                  root.setPadding(pad, dp(36), pad, dp(40));
+                  sv.addView(root);
+                  setContentView(sv);
+
+                  label("iOS 27 Animations", 26, true);
+                  if (shared) label("Changes apply to the next app you open. No reboot needed.", 13, false);
+                  else label("LSPosed does not seem active for this app, so settings will not reach the system.", 13, false);
+
+                  Switch sw = new Switch(this);
+                  sw.setText("Enabled");
+                  sw.setChecked(sp.getBoolean("enabled", true));
+                  sw.setOnCheckedChangeListener((v, on) -> sp.edit().putBoolean("enabled", on).apply());
+                  root.addView(sw);
+
+                  label("Presets", 18, true);
+                  preset("iOS (default)", 520, 30, 0, 0, 0, 8);
+                  preset("Snappy", 380, 25, 0, 0, 0, 11);
+                  preset("Soft and floaty", 650, 35, 0, 0, 10, 6);
+                  preset("Sheet (slide up)", 520, 0, 0, 1, 0, 8);
+                  preset("Zoom", 460, 0, 0, 2, 0, 8);
+
+                  label("Style", 18, true);
+                  radio("Style", "style", new String[] {"Push (slide sideways)", "Sheet (slide up)", "Zoom"}, 0);
+                  radio("Motion curve", "curve", new String[] {"Spring", "iOS ease", "Smooth", "Linear"}, 0);
+
+                  label("Speed and feel", 18, true);
+                  seek("Duration", "duration", 150, 1000, 520, " ms");
+                  seek("Spring snap (higher = faster start)", "snap", 5, 14, 8, "");
+                  seek("Old screen movement", "parallax", 0, 60, 30, " %");
+                  seek("Old screen dimming", "dim", 0, 50, 0, " %");
+
+                  Button test = new Button(this);
+                  test.setText("Try it (opens this screen again)");
+                  test.setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
+                  root.addView(test);
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              private TextView label(String s, int size, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(size);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  t.setPadding(0, dp(14), 0, dp(4));
+                  root.addView(t);
+                  return t;
+              }
+
+              private void seek(final String name, final String key, final int min, int max, int def, final String unit) {
+                  final TextView tv = label("", 15, false);
+                  int cur = sp.getInt(key, def);
+                  tv.setText(name + ": " + cur + unit);
+                  SeekBar sb = new SeekBar(this);
+                  sb.setMax(max - min);
+                  sb.setProgress(cur - min);
+                  sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar s, int p, boolean user) {
+                          int v = p + min;
+                          tv.setText(name + ": " + v + unit);
+                          if (user) sp.edit().putInt(key, v).apply();
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar s) { }
+                      @Override public void onStopTrackingTouch(SeekBar s) { }
+                  });
+                  root.addView(sb);
+              }
+
+              private void radio(String name, final String key, String[] opts, int def) {
+                  label(name, 15, false);
+                  RadioGroup g = new RadioGroup(this);
+                  for (int i = 0; i < opts.length; i++) {
+                      RadioButton r = new RadioButton(this);
+                      r.setText(opts[i]);
+                      r.setId(1000 + i);
+                      g.addView(r);
+                  }
+                  g.check(1000 + sp.getInt(key, def));
+                  g.setOnCheckedChangeListener((grp, id) -> sp.edit().putInt(key, id - 1000).apply());
+                  root.addView(g);
+              }
+
+              private void preset(String name, final int d, final int p, final int c, final int s, final int dim, final int snap) {
+                  Button bt = new Button(this);
+                  bt.setText(name);
+                  bt.setOnClickListener(v -> {
+                      sp.edit().putInt("duration", d).putInt("parallax", p).putInt("curve", c)
+                              .putInt("style", s).putInt("dim", dim).putInt("snap", snap).apply();
+                      recreate();
+                  });
+                  root.addView(bt);
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iOS27-LSPosed-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
